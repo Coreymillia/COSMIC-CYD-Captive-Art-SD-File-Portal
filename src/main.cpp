@@ -22,6 +22,8 @@
 #include <SD.h>
 #include <Arduino_GFX_Library.h>
 #include <XPT2046_Touchscreen.h>
+#include <esp_wifi.h>
+#include "tcpip_adapter.h"
 
 // ── AP config ─────────────────────────────────────────────────────────────────
 const char* AP_SSID   = "COSMIC-CYD FILE GALLERY \xF0\x9F\x8E\xA8";
@@ -48,6 +50,12 @@ XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
 // ── SD card ───────────────────────────────────────────────────────────────────
 SPIClass sdSPI(HSPI);
 static bool sdReady = false;
+
+// ── SD single-visitor lock ────────────────────────────────────────────────────
+// When sdReady, the first device to connect gets exclusive gallery access.
+// Lock clears when that device disconnects.
+static String  sdLockMAC  = "";   // MAC of the locked-in visitor (empty = unlocked)
+static bool    sdLockActive = false;
 
 // ── Visitor counter (NVS persistent) ─────────────────────────────────────────
 static Preferences prefs;
@@ -4788,6 +4796,7 @@ box-shadow:0 0 10px rgba(255,215,0,.05);transition:transform .15s,box-shadow .15
 .fbtn{display:inline-block;font-size:.45rem;letter-spacing:3px;color:rgba(255,215,0,.7);
 border:1px solid rgba(255,215,0,.35);border-radius:5px;padding:3px 8px;margin-right:5px}
 .fcard:hover .fbtn{color:#ffd700;border-color:rgba(255,215,0,.7)}
+.fthumb{width:100%;height:120px;object-fit:cover;border-radius:7px;margin-bottom:6px;display:block;background:rgba(0,0,0,.3)}
 </style></head><body>
 <div class="glw g1"></div><div class="glw g2"></div>
 <nav><a href="/">&#x2190; BACK</a></nav>
@@ -4956,8 +4965,64 @@ String contentType(const String& name) {
     return "application/octet-stream";
 }
 
+// Returns the requesting client's MAC address string (or empty if unknown)
+static String clientMAC() {
+    wifi_sta_list_t stalist;
+    tcpip_adapter_sta_list_t tcplist;
+    if (esp_wifi_ap_get_sta_list(&stalist) != ESP_OK) return "";
+    if (tcpip_adapter_get_sta_list(&stalist, &tcplist) != ESP_OK) return "";
+    IPAddress clientIP = server.client().remoteIP();
+    for (int i = 0; i < tcplist.num; i++) {
+        if (IPAddress(tcplist.sta[i].ip.addr) == clientIP) {
+            char mac[18];
+            uint8_t *m = tcplist.sta[i].mac;
+            snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                     m[0], m[1], m[2], m[3], m[4], m[5]);
+            return String(mac);
+        }
+    }
+    return "";
+}
+
+// Returns true and sends 403 "in use" page if SD is locked by someone else
+static bool sdLockedOut() {
+    if (!sdReady || !sdLockActive) return false;
+    String mac = clientMAC();
+    if (mac.isEmpty() || mac == sdLockMAC) return false;
+    server.send(200, "text/html",
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Gallery In Use</title><style>"
+        "*{margin:0;padding:0;box-sizing:border-box}"
+        "body{background:#000010;min-height:100vh;display:flex;flex-direction:column;"
+        "align-items:center;justify-content:center;font-family:'Courier New',monospace;color:#fff;padding:24px}"
+        "h1{font-size:1.2rem;letter-spacing:5px;color:#ff6b6b;margin-bottom:14px;"
+        "filter:drop-shadow(0 0 10px rgba(255,60,60,.6))}"
+        "p{font-size:.55rem;letter-spacing:2px;color:rgba(255,255,255,.5);text-align:center;line-height:1.8;max-width:320px}"
+        "a{display:inline-block;margin-top:20px;color:rgba(131,56,236,.8);font-size:.5rem;"
+        "letter-spacing:3px;text-decoration:none;border:1px solid rgba(131,56,236,.4);"
+        "padding:7px 16px;border-radius:7px}"
+        "</style></head><body>"
+        "<h1>&#x1F512; GALLERY IN USE</h1>"
+        "<p>The SD card file gallery is currently in use by another visitor.<br><br>"
+        "The gallery will become available once they disconnect.<br><br>"
+        "While you wait, feel free to explore the art modes!</p>"
+        "<a href='/'>&#x2B21; EXPLORE ART MODES</a>"
+        "</body></html>");
+    return true;
+}
+
+static bool isImageFile(const String& name) {
+    String lower = name;
+    lower.toLowerCase();
+    return lower.endsWith(".jpg") || lower.endsWith(".jpeg") ||
+           lower.endsWith(".png") || lower.endsWith(".gif")  ||
+           lower.endsWith(".bmp") || lower.endsWith(".webp");
+}
+
 // ── /gallery ──────────────────────────────────────────────────────────────────
 void handleGallery() {
+    if (sdLockedOut()) return;
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "text/html", "");
     server.sendContent(GALLERY_HTML_HEAD);
@@ -4975,10 +5040,16 @@ void handleGallery() {
                     String name = String(f.name());
                     if (name.startsWith("/")) name = name.substring(1);
                     String sizeStr = formatFileSize(f.size());
-                    String icon    = fileIcon(name);
                     String card    = "<a class=\'fcard\' href=\'/file?n=";
                     card += name;
-                    card += "\'><span class=\'ficon\'>" + icon + "</span>";
+                    card += "\'>";
+                    if (isImageFile(name)) {
+                        card += "<img class=\'fthumb\' src=\'/file?n=";
+                        card += name;
+                        card += "\' loading=\'lazy\' alt=\'\'>";
+                    } else {
+                        card += "<span class=\'ficon\'>" + fileIcon(name) + "</span>";
+                    }
                     card += "<span class=\'fname\'>" + name + "</span>";
                     card += "<span class=\'fsize\'>" + sizeStr + "</span>";
                     card += "<span class=\'fbtn\'>OPEN &rarr;</span>"
@@ -5001,6 +5072,7 @@ void handleGallery() {
 
 // ── /file?n=filename ──────────────────────────────────────────────────────────
 void handleFileServe() {
+    if (sdLockedOut()) return;
     String name = server.arg("n");
     if (name.isEmpty()) { server.send(400, "text/plain", "Missing filename"); return; }
     if (name.startsWith("/")) name = name.substring(1);
@@ -5016,6 +5088,7 @@ void handleFileServe() {
 
 // ── /dl?n=filename (forced download) ─────────────────────────────────────────
 void handleFileDownload() {
+    if (sdLockedOut()) return;
     String name = server.arg("n");
     if (name.isEmpty()) { server.send(400, "text/plain", "Missing filename"); return; }
     if (name.startsWith("/")) name = name.substring(1);
@@ -5229,7 +5302,33 @@ void setup() {
         totalVisits++;
         prefs.putUInt("visits", totalVisits);
         flashUntil = millis() + 600;
+        // SD lock: first visitor gets exclusive gallery access
+        if (sdReady && !sdLockActive) {
+            char mac[18];
+            snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                info.wifi_ap_staconnected.mac[0], info.wifi_ap_staconnected.mac[1],
+                info.wifi_ap_staconnected.mac[2], info.wifi_ap_staconnected.mac[3],
+                info.wifi_ap_staconnected.mac[4], info.wifi_ap_staconnected.mac[5]);
+            sdLockMAC    = String(mac);
+            sdLockActive = true;
+            Serial.printf("SD lock acquired by %s\n", mac);
+        }
     }, ARDUINO_EVENT_WIFI_AP_STACONNECTED);
+
+    WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+        if (sdLockActive) {
+            char mac[18];
+            snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                info.wifi_ap_stadisconnected.mac[0], info.wifi_ap_stadisconnected.mac[1],
+                info.wifi_ap_stadisconnected.mac[2], info.wifi_ap_stadisconnected.mac[3],
+                info.wifi_ap_stadisconnected.mac[4], info.wifi_ap_stadisconnected.mac[5]);
+            if (sdLockMAC == String(mac)) {
+                sdLockMAC    = "";
+                sdLockActive = false;
+                Serial.printf("SD lock released by %s\n", mac);
+            }
+        }
+    }, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
 
     // ── DNS captive portal ────────────────────────────────────────────────────
     IPAddress apIP = WiFi.softAPIP();
