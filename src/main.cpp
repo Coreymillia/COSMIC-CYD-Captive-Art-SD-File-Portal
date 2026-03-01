@@ -42,6 +42,22 @@ Arduino_GFX    *gfx = new Arduino_ILI9341(bus, GFX_NOT_DEFINED /*RST*/, 1 /*rota
 SPIClass touchSPI(VSPI);
 XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
 
+// Touch calibration — adjust if taps feel misaligned
+#define TS_MINX  200
+#define TS_MAXX  3800
+#define TS_MINY  200
+#define TS_MAXY  3800
+
+// ── Preset operator messages ──────────────────────────────────────────────────
+static const char* const PRESETS[] = {
+    "Welcome! Enjoy the portal.",
+    "Check out the art modes!",
+    "SD gallery has new files!",
+    "Thanks for visiting!",
+    "Come back soon!"
+};
+static const int PRESET_COUNT = 5;
+
 // ── RGB LED (active LOW) ──────────────────────────────────────────────────────
 #define LED_R 4
 #define LED_G 16
@@ -68,6 +84,9 @@ static unsigned long lastDispUpdate  = 0;
 static unsigned long flashUntil      = 0;   // ms timestamp until flash effect ends
 static uint16_t     idleHue          = 0;
 static bool         inScreensaver    = false;
+static bool         menuOpen         = false;
+static unsigned long lastTouchMs     = 0;
+static unsigned long menuFeedbackUntil = 0;
 
 // ── Message system (visitor ↔ portal) ─────────────────────────────────────────
 static String        pendingMsg    = "";
@@ -5272,6 +5291,80 @@ static void drawMatrixFrame() {
     }
 }
 
+// ── Preset-message menu (drawn on touch when visitor connected) ───────────────
+// Layout on 320×240:
+//   Header:     y=0..31   (32px)
+//   5 buttons:  y=32..201 (34px each)
+//   Cancel:     y=202..239 (38px)
+#define MENU_HDR_H  32
+#define MENU_BTN_H  34
+#define MENU_CAN_Y  202
+
+static void drawMsgMenu() {
+    gfx->fillScreen(0x0000);
+
+    // Header
+    gfx->fillRect(0, 0, 320, MENU_HDR_H, gfx->color565(0, 30, 60));
+    gfx->drawRect(0, 0, 320, MENU_HDR_H, 0x07FF);
+    gfx->setTextColor(0x07FF);
+    gfx->setTextSize(2);
+    gfx->setCursor(28, 8);
+    gfx->print("SEND MESSAGE");
+
+    // Preset buttons
+    for (int i = 0; i < PRESET_COUNT; i++) {
+        int y = MENU_HDR_H + i * MENU_BTN_H;
+        gfx->fillRect(0, y, 320, MENU_BTN_H - 1, gfx->color565(0, 18, 38));
+        gfx->drawRect(0, y, 320, MENU_BTN_H - 1, gfx->color565(131, 56, 236));
+        gfx->setTextColor(0xFFFF);
+        gfx->setTextSize(1);
+        int len = strlen(PRESETS[i]);
+        gfx->setCursor((320 - len * 6) / 2, y + 13);
+        gfx->print(PRESETS[i]);
+    }
+
+    // Cancel button
+    gfx->fillRect(0, MENU_CAN_Y, 320, 240 - MENU_CAN_Y, gfx->color565(38, 0, 0));
+    gfx->drawRect(0, MENU_CAN_Y, 320, 240 - MENU_CAN_Y, gfx->color565(255, 50, 50));
+    gfx->setTextColor(gfx->color565(255, 80, 80));
+    gfx->setTextSize(2);
+    gfx->setCursor(116, MENU_CAN_Y + 12);
+    gfx->print("CANCEL");
+}
+
+static void updateTouch() {
+    if (!ts.tirqTouched() || !ts.touched()) return;
+    unsigned long now = millis();
+    if (now - lastTouchMs < 350) return;   // debounce
+    lastTouchMs = now;
+
+    TS_Point p = ts.getPoint();
+    int sx = map(p.x, TS_MINX, TS_MAXX, 0, 319);
+    int sy = map(p.y, TS_MINY, TS_MAXY, 0, 239);
+    (void)sx; // x not needed for row-based menu
+
+    int clients = WiFi.softAPgetStationNum();
+
+    if (menuOpen) {
+        menuOpen = false;
+        if (sy >= MENU_CAN_Y) {
+            // Cancel — just restore idle screen
+            gfx->fillScreen(0x0000);
+            return;
+        }
+        int btn = (sy - MENU_HDR_H) / MENU_BTN_H;
+        if (btn >= 0 && btn < PRESET_COUNT) {
+            pendingMsg = String(PRESETS[btn]);
+            msgId++;
+            menuFeedbackUntil = now + 1200;
+        }
+        gfx->fillScreen(0x0000);
+    } else if (clients > 0) {
+        menuOpen = true;
+        drawMsgMenu();
+    }
+}
+
 // ── Non-blocking display update ───────────────────────────────────────────────
 static void updateDisplay() {
     unsigned long now = millis();
@@ -5282,6 +5375,7 @@ static void updateDisplay() {
 
     // ── Screensaver: Matrix rain when nobody is connected ─────────────────────
     if (clients == 0) {
+        menuOpen = false;
         if (!mxReady) mxStart();
         inScreensaver = true;
         drawMatrixFrame();
@@ -5296,6 +5390,17 @@ static void updateDisplay() {
     }
 
     // ── Normal idle panel ─────────────────────────────────────────────────────
+    // Hold while menu or sent-feedback is showing
+    if (menuOpen) return;
+    if (now < menuFeedbackUntil) {
+        gfx->fillScreen(0x0000);
+        gfx->setTextColor(0x07E0);
+        gfx->setTextSize(3);
+        gfx->setCursor(52, 100);
+        gfx->print("MSG SENT!");
+        return;
+    }
+
     if (showVisMsg && now - visitorMsgAt > 8000) {
         showVisMsg = false;
     }
@@ -5526,6 +5631,7 @@ void setup() {
 void loop() {
     dnsServer.processNextRequest();
     server.handleClient();
+    updateTouch();
     updateDisplay();
     updateLED();
 }
