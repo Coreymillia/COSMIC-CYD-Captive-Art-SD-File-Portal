@@ -8,6 +8,35 @@ No internet required. No accounts. No tracking. Just connect and explore.
 
 ---
 
+## Screenshots
+
+### Captive portal prompt
+When you connect to the WiFi, your OS automatically prompts you to sign in:
+
+![OS captive portal sign-in prompt for COSMIC-CYD FILE GALLERY](Screenshot_20260301-143805.png)
+
+### Portal index
+The main portal page — links to the file gallery and all 72+ art modes:
+
+![Portal index page](Screenshot_20260228-165922.png)
+![Portal index — full view](Screenshot_20260301-143945.png)
+
+### Art modes
+Generative art and animations running entirely in the browser — no install, no app:
+
+![Art mode running — animation example 1](Screenshot_20260228-165946.png)
+![Art mode running — animation example 2](Screenshot_20260228-223657.png)
+![Art mode running — animation example 3](Screenshot_20260228-223711.png)
+![Art mode running — animation example 4](Screenshot_20260228-223724.png)
+![Art mode running — animation example 5](Screenshot_20260228-223758.png)
+
+### SD card gallery with thumbnails
+Image files on the SD card are shown as live thumbnails — no app or preprocessing needed:
+
+![SD gallery showing image thumbnails of dog photos](Screenshot_20260301-144007.png)
+
+---
+
 ## What it does
 
 Power it on and your phone sees a WiFi network called **`COSMIC-CYD FILE GALLERY 🎨`**. Connect and you are automatically redirected to the portal. From there you can:
