@@ -67,6 +67,7 @@ static bool         sdReadyLast      = false;
 static unsigned long lastDispUpdate  = 0;
 static unsigned long flashUntil      = 0;   // ms timestamp until flash effect ends
 static uint16_t     idleHue          = 0;
+static bool         inScreensaver    = false;
 
 // ── Message system (visitor ↔ portal) ─────────────────────────────────────────
 static String        pendingMsg    = "";
@@ -5203,13 +5204,98 @@ static void updateLED() {
     digitalWrite(LED_R, HIGH);
 }
 
+// ── Matrix rain screensaver ───────────────────────────────────────────────────
+// 320×240 display, textSize 2 → 12×16 px per cell → 26 cols × 15 rows
+#define MX_COLS  26
+#define MX_ROWS  15
+#define MX_CW    12
+#define MX_CH    16
+
+static int16_t mxPos [MX_COLS];
+static uint8_t mxLen [MX_COLS];
+static uint8_t mxSpd [MX_COLS];
+static uint8_t mxTick[MX_COLS];
+static char    mxChar[MX_COLS][MX_ROWS];
+static bool    mxReady = false;
+
+static char mxRandChar() {
+    static const char pool[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%*+-=?";
+    return pool[random(0, sizeof(pool) - 1)];
+}
+
+static void mxResetCol(int c) {
+    mxPos[c]  = -(int16_t)random(2, MX_ROWS + 5);
+    mxLen[c]  = random(5, 13);
+    mxSpd[c]  = random(1, 4);
+    mxTick[c] = 0;
+}
+
+static void mxStart() {
+    gfx->fillScreen(0x0000);
+    for (int c = 0; c < MX_COLS; c++) {
+        mxResetCol(c);
+        for (int r = 0; r < MX_ROWS; r++) mxChar[c][r] = mxRandChar();
+    }
+    mxReady = true;
+}
+
+static void drawMatrixFrame() {
+    gfx->setTextSize(2);
+    gfx->setTextWrap(false);
+    for (int c = 0; c < MX_COLS; c++) {
+        if (++mxTick[c] < mxSpd[c]) continue;
+        mxTick[c] = 0;
+        int row = mxPos[c];
+
+        // Erase oldest tail cell
+        int eraseRow = row - mxLen[c];
+        if (eraseRow >= 0 && eraseRow < MX_ROWS)
+            gfx->fillRect(c * MX_CW, eraseRow * MX_CH, MX_CW, MX_CH, 0x0000);
+
+        // Dim trail one row above head
+        if (row - 1 >= 0 && row - 1 < MX_ROWS) {
+            gfx->setTextColor(gfx->color565(0, 140, 0), 0x0000);
+            gfx->setCursor(c * MX_CW, (row - 1) * MX_CH);
+            gfx->print(mxChar[c][(row - 1) % MX_ROWS]);
+        }
+
+        // Bright green head with a freshly randomised character
+        if (row >= 0 && row < MX_ROWS) {
+            mxChar[c][row % MX_ROWS] = mxRandChar();
+            gfx->setTextColor(0x07E0, 0x0000);
+            gfx->setCursor(c * MX_CW, row * MX_CH);
+            gfx->print(mxChar[c][row % MX_ROWS]);
+        }
+
+        mxPos[c]++;
+        if (mxPos[c] > MX_ROWS + mxLen[c]) mxResetCol(c);
+    }
+}
+
 // ── Non-blocking display update ───────────────────────────────────────────────
 static void updateDisplay() {
     unsigned long now = millis();
     if (now - lastDispUpdate < 100) return;   // ~10 fps max
     lastDispUpdate = now;
 
-    // Expire visitor message after 8 s
+    int clients = WiFi.softAPgetStationNum();
+
+    // ── Screensaver: Matrix rain when nobody is connected ─────────────────────
+    if (clients == 0) {
+        if (!mxReady) mxStart();
+        inScreensaver = true;
+        drawMatrixFrame();
+        return;
+    }
+
+    // Exiting screensaver — clear matrix off the screen before redrawing idle
+    if (inScreensaver) {
+        inScreensaver = false;
+        mxReady = false;
+        gfx->fillScreen(0x0000);
+    }
+
+    // ── Normal idle panel ─────────────────────────────────────────────────────
     if (showVisMsg && now - visitorMsgAt > 8000) {
         showVisMsg = false;
     }
