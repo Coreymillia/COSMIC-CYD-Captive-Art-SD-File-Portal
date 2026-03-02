@@ -48,6 +48,46 @@ Power it on and your phone sees a WiFi network called **`COSMIC-CYD FILE GALLERY
 
 The CYD display shows the SSID, IP address, live visitor count, and SD card status at a glance. The RGB LED pulses blue at idle and flashes green when someone new connects.
 
+When **no visitor is connected**, the CYD display runs a **Matrix rain screensaver**. You can replace the rain with any JPEG image from your SD card — it stays on the display until you remove it.
+
+---
+
+## Gallery password lock 🔒
+
+> ⚠️ **If your SD card has sensitive files, set a password immediately after flashing.** The gallery is open by default.
+
+The SD file gallery can be locked with a password. Once set, any visitor who tries to open the gallery is shown a login screen first. The password is stored in `/sdpass.txt` on the SD card.
+
+**To set a password:**
+1. Open the portal → tap **🔒 GALLERY LOCK** on the main page
+2. Tap **🔒 PASSWORD** in the gallery nav bar (top-right, purple button)
+3. Enter and confirm your new password — it takes effect immediately
+
+**To change or remove a password:**
+- Navigate to **Gallery → 🔒 PASSWORD**
+- Enter your current password, then set a new one — or leave the new password blank to go passwordless
+
+**How the session works:**
+- Only **one IP at a time** is considered authenticated — when a visitor disconnects, the session clears automatically
+- Internal files (`ssaver.jpg`, `sdpass.txt`) are always hidden from the gallery and blocked from download, regardless of auth state
+
+---
+
+## Screensaver image 🖼️
+
+When no visitor is connected, the CYD display can show a custom JPEG image instead of the Matrix rain.
+
+**To set a screensaver image:**
+1. Open the portal → tap **📺 SCREENSAVER** on the main page  
+   *or* open **SD Gallery → tap the 🖼️ SSAVER button** on any image card
+2. The image is copied to `/ssaver.jpg` on the SD card and shown on the display immediately
+3. The image persists across reboots until you remove it
+
+**To remove the image and return to Matrix rain:**
+- Open the portal → **📺 SCREENSAVER** → tap **✕ REMOVE IMAGE**
+
+You can also upload a JPEG directly from your phone via the Screensaver page without needing it on the SD card first. Images are automatically scaled to fit the 320×240 display.
+
 ---
 
 ## Hardware
@@ -99,9 +139,16 @@ No folders required. Any file in the root is served. Supports JPG, PNG, GIF, BMP
 | Route | Description |
 |---|---|
 | `/` | Main index — file gallery link + all art modes |
-| `/gallery` | Dynamic SD card file browser |
+| `/gallery` | Dynamic SD card file browser (password-gated if set) |
+| `/gallery/login` | Gallery login page |
+| `/gallery/settings` | Password management (change / remove password) |
+| `/screensaver` | Screensaver status + image upload |
+| `/screensaver/pick?file=name` | Set a file from SD as the screensaver image |
+| `/screensaver/clear` | Remove screensaver image, return to Matrix rain |
 | `/file?n=filename` | View / stream a file from SD |
 | `/dl?n=filename` | Force-download a file from SD |
+| `/zip?all=1` | Download all SD files as a ZIP archive |
+| `/zip?files=a,b` | Download selected files as a ZIP archive |
 | `/safety` | Free WiFi safety PSA |
 | `/api/msg` | GET — poll for operator messages |
 | `/api/visitor-msg` | POST — visitor sends message to display |
@@ -145,15 +192,18 @@ Requires [PlatformIO](https://platformio.org/). All dependencies are pulled auto
 
 - [GFX Library for Arduino](https://github.com/moononournation/Arduino_GFX) — display driver
 - [XPT2046_Touchscreen](https://github.com/PaulStoffregen/XPT2046_Touchscreen) — touch controller
+- [JPEGDEC](https://github.com/bitbank2/JPEGDEC) — JPEG decoding for screensaver image display
 - Arduino `SD` library — SD card (bundled with ESP32 Arduino framework)
 - `WebServer`, `DNSServer`, `Preferences` — WiFi portal & NVS (bundled)
 
 ---
 
 ## Notes
-- IMPORTANT NOTE! This is an OPEN portal. The way the file transfer should work is the FIRST person to connect can transfer files. Anyone else who connects (if anyone) then the files should be locked out from anyone else. Meaning. You will want to be the first one to connect. IF you are worried about someone connecting before you OR in general you should NOT put images or files on the SD card that are sensitive!!! STRANGERS WILL be able to download your files if you are not using the portal with your card inserted!!!!
+
 - No internet connection is ever made. The portal is fully self-contained on the device.
 - Visitor count is stored in NVS flash and survives power cycles.
 - The portal HTML, CSS, and all art animations live in flash. The SD card is only for user files.
 - Files are streamed directly from SD to the browser — large files work fine without buffering in RAM.
+- The gallery password is stored in plaintext in `/sdpass.txt` on the SD card. Remove the card to bypass if you forget it.
+- The screensaver image (`/ssaver.jpg`) and password file (`/sdpass.txt`) are always hidden from the gallery listing and cannot be downloaded by visitors.
 - Built on the [COSMIC-S3](../COSMICQT) T-QT Pro edition and ported to CYD with SD gallery added.

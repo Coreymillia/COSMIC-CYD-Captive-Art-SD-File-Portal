@@ -25,6 +25,7 @@
 #include <XPT2046_Touchscreen.h>
 #include <esp_wifi.h>
 #include "tcpip_adapter.h"
+#include <JPEGDEC.h>
 
 // ── AP config ─────────────────────────────────────────────────────────────────
 const char* AP_SSID   = "COSMIC-CYD FILE GALLERY \xF0\x9F\x8E\xA8";
@@ -71,8 +72,10 @@ static bool sdReady = false;
 // ── SD single-visitor lock ────────────────────────────────────────────────────
 // When sdReady, the first device to connect gets exclusive gallery access.
 // Lock clears when that device disconnects.
-static String  sdLockMAC  = "";   // MAC of the locked-in visitor (empty = unlocked)
+static String  sdLockMAC    = "";   // MAC of the locked-in visitor (empty = unlocked)
 static bool    sdLockActive = false;
+static String  sdPassword   = "";   // "" = no password required; loaded from /sdpass.txt
+static String  sdAuthIP     = "";   // IP of authenticated visitor (empty = none)
 
 // ── Visitor counter (NVS persistent) ─────────────────────────────────────────
 static Preferences prefs;
@@ -84,7 +87,9 @@ static bool         sdReadyLast      = false;
 static unsigned long lastDispUpdate  = 0;
 static unsigned long flashUntil      = 0;   // ms timestamp until flash effect ends
 static uint16_t     idleHue          = 0;
-static bool         inScreensaver    = false;
+static bool         inScreensaver     = false;
+static bool         ssaverImageActive = false;  // true when /ssaver.jpg on SD
+static bool         ssaverImageShown  = false;  // true after image decoded once
 static bool         menuOpen         = false;
 static unsigned long lastTouchMs     = 0;
 static unsigned long menuFeedbackUntil = 0;
@@ -164,6 +169,16 @@ footer{margin-top:16px;font-size:.4rem;letter-spacing:4px;color:rgba(255,255,255
     <span class="icon">&#x1F4C1;</span>
     <span class="name n8">FILE GALLERY</span>
     <span class="desc">BROWSE &amp; DOWNLOAD &middot; SD CARD FILES</span>
+  </a>
+  <a class="card c5" href="/screensaver">
+    <span class="icon">&#x1F5BC;</span>
+    <span class="name n5">SCREENSAVER</span>
+    <span class="desc">SET DISPLAY IMAGE</span>
+  </a>
+  <a class="card" style="background:rgba(131,56,236,.12);border:1px solid rgba(131,56,236,.35)" href="/gallery/settings">
+    <span class="icon">&#x1F512;</span>
+    <span class="name" style="color:#c77dff">GALLERY LOCK</span>
+    <span class="desc">SET &middot; CHANGE &middot; REMOVE PASSWORD</span>
   </a>
 </div>
 
@@ -4798,9 +4813,11 @@ font-family:'Courier New',monospace;color:#fff;padding:20px 12px 80px}
 .glw{position:fixed;border-radius:50%;filter:blur(90px);z-index:-1;pointer-events:none}
 .g1{width:350px;height:350px;top:-120px;left:-120px;background:rgba(131,56,236,.3)}
 .g2{width:300px;height:300px;bottom:-100px;right:-100px;background:rgba(255,215,0,.12)}
-nav{width:min(460px,92vw);display:flex;align-items:center;gap:10px;margin-bottom:18px}
+nav{width:min(460px,92vw);display:flex;align-items:center;gap:10px;margin-bottom:18px;flex-wrap:wrap}
 nav a{font-size:.5rem;letter-spacing:4px;color:rgba(255,215,0,.6);text-decoration:none;padding:5px 10px;border:1px solid rgba(255,215,0,.25);border-radius:6px}
 nav a:hover{color:#ffd700;border-color:rgba(255,215,0,.6)}
+.nav-sec{margin-left:auto;color:rgba(199,119,255,.7)!important;border-color:rgba(131,56,236,.4)!important}
+.nav-sec:hover{color:#c77dff!important;border-color:rgba(131,56,236,.8)!important}
 h1{font-size:clamp(1rem,4vw,1.5rem);letter-spacing:7px;text-align:center;margin-bottom:3px;
 background:linear-gradient(90deg,#ffd700,#ff9500,#ffd700);
 -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
@@ -4831,7 +4848,7 @@ color:rgba(255,215,0,.65);background:transparent;cursor:pointer;text-decoration:
 .bprim{background:rgba(255,215,0,.12);color:#ffd700;border-color:rgba(255,215,0,.6)}
 </style></head><body>
 <div class="glw g1"></div><div class="glw g2"></div>
-<nav><a href="/">&#x2190; BACK</a></nav>
+<nav><a href="/">&#x2190; BACK</a><a href="/gallery/settings" class="nav-sec">&#x1F512; PASSWORD</a></nav>
 <h1>SD FILE GALLERY</h1>
 <p class="sub">BROWSE &amp; DOWNLOAD FILES</p>
 <div class="bar">
@@ -5065,12 +5082,291 @@ static bool isImageFile(const String& name) {
            lower.endsWith(".bmp") || lower.endsWith(".webp");
 }
 
+// ── SD gallery password auth ───────────────────────────────────────────────────
+static inline bool sdPassRequired() { return sdPassword.length() > 0; }
+static inline bool sdIsAuthed() {
+    if (!sdPassRequired()) return true;
+    return server.client().remoteIP().toString() == sdAuthIP;
+}
+static void savePassword(const String& pw) {
+    SD.remove("/sdpass.txt");
+    if (pw.length() > 0) {
+        File f = SD.open("/sdpass.txt", FILE_WRITE);
+        if (f) { f.print(pw); f.close(); }
+    }
+    sdPassword = pw;
+}
+static const char* SD_AUTH_CSS =
+    "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<style>*{margin:0;padding:0;box-sizing:border-box}"
+    "body{background:radial-gradient(ellipse at 50% 50%,#0d003d,#000010 70%);"
+    "min-height:100vh;display:flex;flex-direction:column;align-items:center;"
+    "justify-content:center;font-family:'Courier New',monospace;color:#fff;padding:24px}"
+    "h1{font-size:1.1rem;letter-spacing:6px;text-align:center;margin-bottom:6px;"
+    "background:linear-gradient(90deg,#c77dff,#8338ec);-webkit-background-clip:text;"
+    "-webkit-text-fill-color:transparent}"
+    ".sub{font-size:.4rem;letter-spacing:6px;color:rgba(199,119,255,.35);margin-bottom:24px;text-align:center}"
+    ".box{width:min(340px,94vw);background:rgba(20,0,40,.75);"
+    "border:1px solid rgba(131,56,236,.4);border-radius:12px;padding:22px;margin-bottom:12px}"
+    ".lbl{font-size:.4rem;letter-spacing:4px;color:rgba(199,119,255,.6);display:block;margin-bottom:6px}"
+    "input[type=password]{width:100%;padding:9px;background:rgba(0,0,0,.5);"
+    "border:1px solid rgba(131,56,236,.5);border-radius:6px;color:#c77dff;"
+    "font-family:'Courier New',monospace;font-size:.55rem;margin-bottom:12px}"
+    ".btn{width:100%;padding:11px;background:rgba(131,56,236,.18);border:1px solid rgba(131,56,236,.6);"
+    "border-radius:8px;color:#c77dff;font-family:'Courier New',monospace;font-size:.5rem;"
+    "letter-spacing:3px;cursor:pointer}"
+    ".btn:active{background:rgba(131,56,236,.4)}"
+    ".err{color:rgba(255,100,100,.8);font-size:.45rem;letter-spacing:2px;margin-bottom:10px;text-align:center}"
+    ".ok{color:rgba(100,255,150,.8);font-size:.45rem;letter-spacing:2px;margin-bottom:10px;text-align:center}"
+    ".lnk{display:block;text-align:center;margin-top:16px;color:rgba(131,56,236,.7);"
+    "font-size:.42rem;letter-spacing:3px;text-decoration:none}"
+    "nav a{font-size:.45rem;letter-spacing:4px;color:rgba(199,119,255,.55);text-decoration:none;"
+    "padding:5px 10px;border:1px solid rgba(199,119,255,.25);border-radius:6px;display:inline-block;margin-bottom:20px}"
+    ".danger{background:rgba(80,0,0,.45);border-color:rgba(255,50,50,.5);color:rgba(255,100,100,.8)}"
+    "</style></head><body>";
+
+void handleGalleryLogin() {
+    if (server.method() == HTTP_POST) {
+        String pw = server.arg("pw"); pw.trim();
+        if (pw == sdPassword) {
+            sdAuthIP = server.client().remoteIP().toString();
+            server.sendHeader("Location", "/gallery", true);
+            server.send(302, "text/plain", "");
+        } else {
+            String html = String(SD_AUTH_CSS);
+            html += "<h1>&#x1F511; SD GALLERY</h1><p class='sub'>PASSWORD REQUIRED</p>"
+                    "<div class='box'><span class='err'>&#x2717; INCORRECT PASSWORD</span>"
+                    "<form method='POST'><label class='lbl'>PASSWORD</label>"
+                    "<input type='password' name='pw' placeholder='enter password' autofocus>"
+                    "<button class='btn' type='submit'>UNLOCK &#x2192;</button></form></div>"
+                    "<a class='lnk' href='/'>&#x2190; BACK</a></body></html>";
+            server.send(200, "text/html", html);
+        }
+        return;
+    }
+    String html = String(SD_AUTH_CSS);
+    html += "<h1>&#x1F511; SD GALLERY</h1><p class='sub'>PASSWORD REQUIRED</p>"
+            "<div class='box'><form method='POST'><label class='lbl'>PASSWORD</label>"
+            "<input type='password' name='pw' placeholder='enter password' autofocus>"
+            "<button class='btn' type='submit'>UNLOCK &#x2192;</button></form></div>"
+            "<a class='lnk' href='/'>&#x2190; BACK</a></body></html>";
+    server.send(200, "text/html", html);
+}
+
+void handleGallerySettings() {
+    if (!sdIsAuthed()) {
+        server.sendHeader("Location", "/gallery/login", true);
+        server.send(302, "text/plain", ""); return;
+    }
+    String msg = server.arg("msg");
+    String html = String(SD_AUTH_CSS);
+    html += "<nav><a href='/gallery'>&#x2190; GALLERY</a></nav>"
+            "<h1>&#x1F512; GALLERY SECURITY</h1><p class='sub'>SD FOLDER PROTECTION</p>";
+    if (msg == "set_ok")   html += "<p class='ok'>&#x2714; PASSWORD SET</p>";
+    if (msg == "clear_ok") html += "<p class='ok'>&#x2714; PASSWORD REMOVED</p>";
+    if (msg == "bad_cur")  html += "<p class='err'>&#x2717; CURRENT PASSWORD INCORRECT</p>";
+    if (msg == "mismatch") html += "<p class='err'>&#x2717; NEW PASSWORDS DO NOT MATCH</p>";
+    if (msg == "empty")    html += "<p class='err'>&#x2717; PASSWORD CANNOT BE EMPTY</p>";
+    if (!sdPassRequired()) {
+        html += "<div class='box'><label class='lbl'>SET A PASSWORD</label>"
+                "<form method='POST' action='/gallery/setpass'>"
+                "<input type='hidden' name='action' value='set'>"
+                "<label class='lbl'>NEW PASSWORD</label>"
+                "<input type='password' name='pw1' placeholder='enter new password'>"
+                "<label class='lbl'>CONFIRM PASSWORD</label>"
+                "<input type='password' name='pw2' placeholder='confirm password'>"
+                "<button class='btn' type='submit'>SET PASSWORD &#x2192;</button></form>"
+                "<p style='font-size:.38rem;letter-spacing:2px;color:rgba(255,255,255,.2);margin-top:10px'>"
+                "No password is currently required to access the gallery.</p></div>";
+    } else {
+        html += "<div class='box'><label class='lbl'>CHANGE PASSWORD</label>"
+                "<form method='POST' action='/gallery/setpass'>"
+                "<input type='hidden' name='action' value='change'>"
+                "<label class='lbl'>CURRENT PASSWORD</label>"
+                "<input type='password' name='cur' placeholder='current password'>"
+                "<label class='lbl'>NEW PASSWORD</label>"
+                "<input type='password' name='pw1' placeholder='new password'>"
+                "<label class='lbl'>CONFIRM NEW PASSWORD</label>"
+                "<input type='password' name='pw2' placeholder='confirm new password'>"
+                "<button class='btn' type='submit'>CHANGE PASSWORD &#x2192;</button></form></div>"
+                "<div class='box'><label class='lbl'>REMOVE PASSWORD</label>"
+                "<form method='POST' action='/gallery/setpass'>"
+                "<input type='hidden' name='action' value='remove'>"
+                "<label class='lbl'>CURRENT PASSWORD (TO CONFIRM)</label>"
+                "<input type='password' name='cur' placeholder='current password'>"
+                "<button class='btn danger' type='submit'>REMOVE &mdash; GO PASSWORDLESS</button></form></div>";
+    }
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+}
+
+void handleGallerySetPass() {
+    if (!sdIsAuthed()) {
+        server.sendHeader("Location", "/gallery/login", true);
+        server.send(302, "text/plain", ""); return;
+    }
+    String action = server.arg("action");
+    if (action == "set") {
+        String pw1 = server.arg("pw1"); pw1.trim();
+        String pw2 = server.arg("pw2"); pw2.trim();
+        if (pw1.length() == 0) { server.sendHeader("Location","/gallery/settings?msg=empty",true); server.send(302,"",""); return; }
+        if (pw1 != pw2)        { server.sendHeader("Location","/gallery/settings?msg=mismatch",true); server.send(302,"",""); return; }
+        savePassword(pw1); sdAuthIP = server.client().remoteIP().toString();
+        server.sendHeader("Location","/gallery/settings?msg=set_ok",true); server.send(302,"","");
+    } else if (action == "change") {
+        String cur = server.arg("cur"); cur.trim();
+        String pw1 = server.arg("pw1"); pw1.trim();
+        String pw2 = server.arg("pw2"); pw2.trim();
+        if (cur != sdPassword) { server.sendHeader("Location","/gallery/settings?msg=bad_cur",true); server.send(302,"",""); return; }
+        if (pw1.length() == 0) { server.sendHeader("Location","/gallery/settings?msg=empty",true); server.send(302,"",""); return; }
+        if (pw1 != pw2)        { server.sendHeader("Location","/gallery/settings?msg=mismatch",true); server.send(302,"",""); return; }
+        savePassword(pw1); sdAuthIP = server.client().remoteIP().toString();
+        server.sendHeader("Location","/gallery/settings?msg=set_ok",true); server.send(302,"","");
+    } else if (action == "remove") {
+        String cur = server.arg("cur"); cur.trim();
+        if (cur != sdPassword) { server.sendHeader("Location","/gallery/settings?msg=bad_cur",true); server.send(302,"",""); return; }
+        savePassword(""); sdAuthIP = "";
+        server.sendHeader("Location","/gallery/settings?msg=clear_ok",true); server.send(302,"","");
+    } else {
+        server.sendHeader("Location","/gallery/settings",true); server.send(302,"","");
+    }
+}
+
+// ── JPEG screensaver image display ────────────────────────────────────────────
+static JPEGDEC   ssJpeg;
+static File      ssJpegFile;
+
+static int32_t ssJpegRead(JPEGFILE *pFile, uint8_t *pBuf, int32_t iLen) {
+    (void)pFile; return (int32_t)ssJpegFile.read(pBuf, iLen);
+}
+static int32_t ssJpegSeek(JPEGFILE *pFile, int32_t iPos) {
+    (void)pFile; return ssJpegFile.seek(iPos) ? iPos : 0;
+}
+static void ssJpegClose(void *pHandle) {
+    (void)pHandle; ssJpegFile.close();
+}
+static int ssJpegDraw(JPEGDRAW *pDraw) {
+    gfx->draw16bitBeRGBBitmap(pDraw->x, pDraw->y, pDraw->pPixels, pDraw->iWidth, pDraw->iHeight);
+    return 1;
+}
+static void showSsaverImage() {
+    ssJpegFile = SD.open("/ssaver.jpg");
+    if (!ssJpegFile) return;
+    int32_t fsize = ssJpegFile.size();
+    if (!ssJpeg.open((void*)&ssJpegFile, fsize, ssJpegClose, ssJpegRead, ssJpegSeek, ssJpegDraw)) {
+        ssJpegFile.close(); return;
+    }
+    int imgW = ssJpeg.getWidth();
+    int imgH = ssJpeg.getHeight();
+    int scaleOpt = JPEG_SCALE_EIGHTH; int div = 8;
+    if (imgW / 1 <= 320 && imgH / 1 <= 240) { scaleOpt = 0;                    div = 1; }
+    else if (imgW / 2 <= 320 && imgH / 2 <= 240) { scaleOpt = JPEG_SCALE_HALF;    div = 2; }
+    else if (imgW / 4 <= 320 && imgH / 4 <= 240) { scaleOpt = JPEG_SCALE_QUARTER; div = 4; }
+    int sw = imgW / div; int sh = imgH / div;
+    int xOff = (sw <= 320) ? (320 - sw) / 2 : -((sw - 320) / 2);
+    int yOff = (sh <= 240) ? (240 - sh) / 2 : -((sh - 240) / 2);
+    gfx->fillScreen(0x0000);
+    ssJpeg.setPixelType(RGB565_BIG_ENDIAN);
+    ssJpeg.decode(xOff, yOff, scaleOpt);
+    ssJpeg.close();
+}
+
+// ── /screensaver ──────────────────────────────────────────────────────────────
+static File ssaverUploadFile;
+
+void handleSsaverGet() {
+    String html = F("<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>SCREENSAVER</title><style>"
+        "*{margin:0;padding:0;box-sizing:border-box}"
+        "body{background:radial-gradient(ellipse at 50% 50%,#0d003d,#000010 70%);"
+        "min-height:100vh;display:flex;flex-direction:column;align-items:center;"
+        "font-family:'Courier New',monospace;color:#fff;padding:30px 16px}"
+        "nav a{font-size:.5rem;letter-spacing:4px;color:rgba(199,119,255,.55);"
+        "text-decoration:none;padding:5px 10px;border:1px solid rgba(199,119,255,.25);border-radius:6px}"
+        "h1{font-size:1.2rem;letter-spacing:7px;text-align:center;margin:20px 0 4px;"
+        "background:linear-gradient(90deg,#c77dff,#8338ec,#c77dff);"
+        "-webkit-background-clip:text;-webkit-text-fill-color:transparent}"
+        ".sub{font-size:.45rem;letter-spacing:7px;color:rgba(199,119,255,.35);margin-bottom:24px;text-align:center}"
+        ".box{width:min(380px,94vw);background:rgba(20,0,40,.75);"
+        "border:1px solid rgba(131,56,236,.4);border-radius:12px;padding:22px;margin-bottom:16px}"
+        ".lbl{font-size:.45rem;letter-spacing:4px;color:rgba(199,119,255,.6);display:block;margin-bottom:10px}"
+        ".active{font-size:.55rem;letter-spacing:3px;color:#c77dff;display:block;margin-bottom:14px}"
+        ".btn{display:block;width:100%;padding:11px;margin-top:14px;"
+        "background:rgba(131,56,236,.18);border:1px solid rgba(131,56,236,.6);"
+        "border-radius:8px;color:#c77dff;font-family:'Courier New',monospace;"
+        "font-size:.52rem;letter-spacing:3px;cursor:pointer;text-align:center;text-decoration:none}"
+        ".btn:active{background:rgba(131,56,236,.4)}"
+        ".clr{background:rgba(80,0,0,.45);border-color:rgba(255,50,50,.5);color:rgba(255,100,100,.8)}"
+        "input[type=file]{width:100%;padding:8px 4px;background:rgba(0,0,0,.4);"
+        "border:1px solid rgba(131,56,236,.4);border-radius:6px;color:#c77dff;"
+        "font-family:'Courier New',monospace;font-size:.48rem}"
+        ".hint{font-size:.38rem;letter-spacing:2px;color:rgba(255,255,255,.2);margin-top:10px;text-align:center}"
+        "</style></head><body>"
+        "<nav><a href='/'>&#x2190; BACK</a></nav>"
+        "<h1>SCREENSAVER</h1><p class='sub'>CYD DISPLAY IMAGE</p>");
+    if (ssaverImageActive) {
+        html += F("<div class='box'><span class='lbl'>CURRENT STATUS</span>"
+                  "<span class='active'>&#x2714; IMAGE ACTIVE</span>"
+                  "<a href='/screensaver/clear' class='btn clr'>&#x2715; REMOVE IMAGE</a></div>");
+    }
+    html += F("<div class='box'><span class='lbl'>PICK FROM SD CARD</span>"
+              "<a href='/gallery' class='btn'>&#x1F4C2; BROWSE SD FILES &rarr;</a>"
+              "<p class='hint'>Open the SD gallery &mdash; tap &ldquo;SSAVER&rdquo; on any image to set it.</p></div>"
+              "<div class='box'><span class='lbl'>OR UPLOAD A JPG FROM DEVICE</span>"
+              "<form method='POST' action='/screensaver' enctype='multipart/form-data'>"
+              "<input type='file' name='img' accept='image/jpeg,.jpg,.jpeg' required>"
+              "<button type='submit' class='btn'>&#x2B06; UPLOAD &amp; SET</button></form>"
+              "<p class='hint'>Open in Safari/Chrome (not the auto-popup). 320x240 px works best.</p>"
+              "</div></body></html>");
+    server.send(200, "text/html", html);
+}
+void handleSsaverPost() {
+    server.sendHeader("Location", "/screensaver", true);
+    server.send(302, "text/plain", "");
+}
+void handleSsaverUpload() {
+    if (!sdReady) return;
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+        SD.remove("/ssaver.jpg");
+        ssaverUploadFile = SD.open("/ssaver.jpg", FILE_WRITE);
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (ssaverUploadFile) ssaverUploadFile.write(upload.buf, upload.currentSize);
+    } else if (upload.status == UPLOAD_FILE_END) {
+        if (ssaverUploadFile) { ssaverUploadFile.close(); ssaverImageActive = true; ssaverImageShown = false; }
+    }
+}
+void handleSsaverClear() {
+    SD.remove("/ssaver.jpg"); ssaverImageActive = false; ssaverImageShown = false;
+    server.sendHeader("Location", "/screensaver", true); server.send(302, "text/plain", "");
+}
+void handleSsaverPick() {
+    if (!sdReady) { server.send(503, "text/plain", "SD not ready"); return; }
+    String name = server.arg("file"); name.trim();
+    if (name.isEmpty() || name.indexOf("..") >= 0 || !isImageFile(name)) {
+        server.send(400, "text/plain", "Invalid file"); return;
+    }
+    if (name.startsWith("/")) name = name.substring(1);
+    if (!SD.exists("/" + name)) { server.send(404, "text/plain", "Not found"); return; }
+    SD.remove("/ssaver.jpg");
+    File in = SD.open("/" + name); File out = SD.open("/ssaver.jpg", FILE_WRITE);
+    if (in && out) {
+        uint8_t buf[512]; int n;
+        while ((n = in.read(buf, sizeof(buf))) > 0) out.write(buf, n);
+        out.close(); in.close(); ssaverImageActive = true; ssaverImageShown = false;
+    } else {
+        if (in) in.close(); if (out) out.close();
+        server.send(500, "text/plain", "Copy failed"); return;
+    }
+    server.sendHeader("Location", "/screensaver", true); server.send(302, "text/plain", "");
+}
+
 // ── /gallery ──────────────────────────────────────────────────────────────────
 void handleGallery() {
+    if (!sdIsAuthed()) { server.sendHeader("Location","/gallery/login",true); server.send(302,"",""); return; }
     if (sdLockedOut()) return;
-    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    server.send(200, "text/html", "");
-    server.sendContent(GALLERY_HTML_HEAD);
 
     if (!sdReady) {
         server.sendContent("<p style=\'color:rgba(255,100,100,.7);text-align:center;font-size:.6rem;letter-spacing:3px;padding:30px\'>SD CARD NOT MOUNTED</p>");
@@ -5081,9 +5377,13 @@ void handleGallery() {
             File f = root.openNextFile();
             while (f) {
                 if (!f.isDirectory()) {
-                    count++;
                     String name = String(f.name());
                     if (name.startsWith("/")) name = name.substring(1);
+                    // skip internal files
+                    if (name == "ssaver.jpg" || name == "sdpass.txt") {
+                        f.close(); f = root.openNextFile(); continue;
+                    }
+                    count++;
                     String sizeStr = formatFileSize(f.size());
                     String card    = "<div class=\'fwrap\'><label class=\'fchk\'><input type=\'checkbox\' value=\'";
                     card += name;
@@ -5102,7 +5402,13 @@ void handleGallery() {
                     card += "<span class=\'fbtn\'>OPEN &rarr;</span>"
                             "<a class=\'fbtn\' style=\'text-decoration:none\' href=\'/dl?n=";
                     card += name;
-                    card += "\'>DL</a></a></div>";
+                    card += "\'>DL</a>";
+                    if (isImageFile(name)) {
+                        card += "<a class=\'fbtn\' style=\'text-decoration:none;background:rgba(131,56,236,.25)\' href=\'/screensaver/pick?file=";
+                        card += name;
+                        card += "\'>&#x1F5BC; SSAVER</a>";
+                    }
+                    card += "</a></div>";
                     server.sendContent(card);
                 }
                 f.close();
@@ -5119,11 +5425,12 @@ void handleGallery() {
 
 // ── /file?n=filename ──────────────────────────────────────────────────────────
 void handleFileServe() {
+    if (!sdIsAuthed()) { server.sendHeader("Location","/gallery/login",true); server.send(302,"",""); return; }
     if (sdLockedOut()) return;
     String name = server.arg("n");
     if (name.isEmpty()) { server.send(400, "text/plain", "Missing filename"); return; }
     if (name.startsWith("/")) name = name.substring(1);
-    if (name.indexOf("..") >= 0) { server.send(403, "text/plain", "Forbidden"); return; }
+    if (name.indexOf("..") >= 0 || name == "sdpass.txt") { server.send(403, "text/plain", "Forbidden"); return; }
     if (!sdReady) { server.send(503, "text/plain", "SD not ready"); return; }
     String path = "/" + name;
     File f = SD.open(path);
@@ -5135,11 +5442,12 @@ void handleFileServe() {
 
 // ── /dl?n=filename (forced download) ─────────────────────────────────────────
 void handleFileDownload() {
+    if (!sdIsAuthed()) { server.sendHeader("Location","/gallery/login",true); server.send(302,"",""); return; }
     if (sdLockedOut()) return;
     String name = server.arg("n");
     if (name.isEmpty()) { server.send(400, "text/plain", "Missing filename"); return; }
     if (name.startsWith("/")) name = name.substring(1);
-    if (name.indexOf("..") >= 0) { server.send(403, "text/plain", "Forbidden"); return; }
+    if (name.indexOf("..") >= 0 || name == "sdpass.txt") { server.send(403, "text/plain", "Forbidden"); return; }
     if (!sdReady) { server.send(503, "text/plain", "SD not ready"); return; }
     String path = "/" + name;
     File f = SD.open(path);
@@ -5153,6 +5461,7 @@ void handleFileDownload() {
 // /zip?all=1              → every file on the SD card
 // /zip?files=a.jpg,b.png → specific comma-separated files
 void handleZipDownload() {
+    if (!sdIsAuthed()) { server.sendHeader("Location","/gallery/login",true); server.send(302,"",""); return; }
     if (sdLockedOut()) return;
     if (!sdReady) { server.send(503, "text/plain", "SD not ready"); return; }
 
@@ -5166,7 +5475,7 @@ void handleZipDownload() {
                 if (!f.isDirectory()) {
                     String n = String(f.name());
                     if (n.startsWith("/")) n = n.substring(1);
-                    if (n.indexOf("..") < 0) files.push_back(n);
+                    if (n.indexOf("..") < 0 && n != "ssaver.jpg" && n != "sdpass.txt") files.push_back(n);
                 }
                 f.close();
                 f = root.openNextFile();
@@ -5521,18 +5830,23 @@ static void updateDisplay() {
 
     int clients = WiFi.softAPgetStationNum();
 
-    // ── Screensaver: Matrix rain when nobody is connected ─────────────────────
+    // ── Screensaver: when nobody is connected ─────────────────────────────────
     if (clients == 0) {
         menuOpen = false;
-        if (!mxReady) mxStart();
         inScreensaver = true;
-        drawMatrixFrame();
+        if (ssaverImageActive) {
+            if (!ssaverImageShown) { showSsaverImage(); ssaverImageShown = true; }
+        } else {
+            if (!mxReady) mxStart();
+            drawMatrixFrame();
+        }
         return;
     }
 
     // Exiting screensaver — clear matrix off the screen before redrawing idle
     if (inScreensaver) {
         inScreensaver = false;
+        ssaverImageShown = false;
         mxReady = false;
         gfx->fillScreen(0x0000);
     }
@@ -5621,6 +5935,10 @@ void setup() {
         gfx->setTextColor(0x07E0);
         gfx->print("SD: READY");
         Serial.println("SD card ready");
+        // load password and screensaver state
+        File pf = SD.open("/sdpass.txt");
+        if (pf) { sdPassword = pf.readString(); sdPassword.trim(); pf.close(); }
+        ssaverImageActive = SD.exists("/ssaver.jpg");
     } else {
         gfx->setTextColor(0xF800);
         gfx->print("SD: NO CARD");
@@ -5667,6 +5985,7 @@ void setup() {
                 Serial.printf("SD lock released by %s\n", mac);
             }
         }
+        sdAuthIP = "";  // clear auth whenever any client disconnects
     }, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
 
     // ── DNS captive portal ────────────────────────────────────────────────────
@@ -5747,10 +6066,18 @@ void setup() {
     server.on("/warpgrid",     HTTP_GET,  handleWarpgrid);
     server.on("/nebula",       HTTP_GET,  handleNebula);
     // SD gallery
-    server.on("/gallery",      HTTP_GET,  handleGallery);
-    server.on("/file",         HTTP_GET,  handleFileServe);
-    server.on("/dl",           HTTP_GET,  handleFileDownload);
-    server.on("/zip",          HTTP_GET,  handleZipDownload);
+    server.on("/gallery",          HTTP_GET,  handleGallery);
+    server.on("/gallery/login",    HTTP_GET,  handleGalleryLogin);
+    server.on("/gallery/login",    HTTP_POST, handleGalleryLogin);
+    server.on("/gallery/settings", HTTP_GET,  handleGallerySettings);
+    server.on("/gallery/setpass",  HTTP_POST, handleGallerySetPass);
+    server.on("/file",             HTTP_GET,  handleFileServe);
+    server.on("/dl",               HTTP_GET,  handleFileDownload);
+    server.on("/zip",              HTTP_GET,  handleZipDownload);
+    server.on("/screensaver",      HTTP_GET,  handleSsaverGet);
+    server.on("/screensaver",      HTTP_POST, handleSsaverPost,  handleSsaverUpload);
+    server.on("/screensaver/clear",HTTP_GET,  handleSsaverClear);
+    server.on("/screensaver/pick", HTTP_GET,  handleSsaverPick);
     // API
     server.on("/api/msg",          HTTP_GET,  handleApiMsg);
     server.on("/api/visitor-msg",  HTTP_POST, handleApiVisitorMsg);
